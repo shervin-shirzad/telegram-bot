@@ -1,7 +1,6 @@
 import os
 import json
 import logging
-import tempfile
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -16,10 +15,10 @@ from keep_alive import keep_alive  # وب‌سرور برای آنلاین ما�
 CONFIG_FILE = 'config.json'
 BAD_WORDS = ["کص", "کون", "کیر"]
 votes = {}  # ذخیره رأی‌ها
+last_messages = {}  # ذخیره آخرین پیام هر کاربر: user_id -> message_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 
 # ---------- Config ----------
 def load_config():
@@ -30,14 +29,11 @@ def load_config():
     save_config(cfg)
     return cfg
 
-
 def save_config(cfg):
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
-
 cfg = load_config()
-
 
 # ---------- Helpers ----------
 def censor_text(text):
@@ -45,22 +41,20 @@ def censor_text(text):
         text = text.replace(word, "***")
     return text
 
-
 def build_vote_keyboard(message_id):
     like = votes.get(message_id, {}).get("like", 0)
     dislike = votes.get(message_id, {}).get("dislike", 0)
     return InlineKeyboardMarkup([[
         InlineKeyboardButton(f"👍 {like}", callback_data=f"{message_id}:like"),
-        InlineKeyboardButton(f"👎 {dislike}",
-                             callback_data=f"{message_id}:dislike")
+        InlineKeyboardButton(f"👎 {dislike}", callback_data=f"{message_id}:dislike")
     ]])
-
 
 async def send_anonymous(context: ContextTypes.DEFAULT_TYPE,
                          chat_id,
                          text,
                          file=None,
-                         ftype=None):
+                         ftype=None,
+                         user_id=None):
     msg_kwargs = {
         "chat_id": chat_id,
         "caption": text
@@ -68,6 +62,7 @@ async def send_anonymous(context: ContextTypes.DEFAULT_TYPE,
         "chat_id": chat_id,
         "text": text
     }
+
     if ftype == "photo":
         msg = await context.bot.send_photo(photo=file, **msg_kwargs)
     elif ftype == "video":
@@ -77,21 +72,39 @@ async def send_anonymous(context: ContextTypes.DEFAULT_TYPE,
     else:
         msg = await context.bot.send_message(**msg_kwargs)
 
+    # ذخیره آراء برای پیام جدید
     votes[msg.message_id] = {"like": 0, "dislike": 0, "voters": set()}
-    # اضافه کردن دکمه رأی
-    await msg.edit_reply_markup(
-        reply_markup=build_vote_keyboard(msg.message_id))
 
+    # اضافه کردن دکمه رأی
+    await msg.edit_reply_markup(reply_markup=build_vote_keyboard(msg.message_id))
+
+    # ذخیره آخرین پیام کاربر
+    if user_id:
+        last_messages[user_id] = msg.message_id
+
+    return msg
 
 # ---------- Handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == 'private':
         await update.message.reply_text(
-            "پیام خودت را اینجا بفرست تا ناشناس در گروه ارسال شود.")
+            "سلام 👋\nپیام خودت را اینجا بفرست تا ناشناس در گروه ارسال شود.\n\n"
+            "دستورها:\n"
+            "/edit متن جدید - ویرایش آخرین پیام\n"
+            "/help - نمایش دستورها"
+        )
     else:
         await update.message.reply_text(
             "ادمین باید /setgroup را داخل گروه بزند.")
 
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "دستورهای ربات:\n"
+        "/start - شروع ربات و راهنمایی\n"
+        "/setgroup - تعیین گروه برای پیام‌های ناشناس (فقط در گروه)\n"
+        "/edit متن جدید - ویرایش آخرین پیام ناشناس شما\n"
+        "/help - نمایش این راهنما"
+    )
 
 async def setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -100,9 +113,7 @@ async def setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     cfg["group_id"] = chat.id
     save_config(cfg)
-    await update.message.reply_text(
-        "این گروه به‌عنوان مقصد پیام‌های ناشناس تنظیم شد ✅")
-
+    await update.message.reply_text("این گروه به‌عنوان مقصد پیام‌های ناشناس تنظیم شد ✅")
 
 async def handle_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
@@ -136,12 +147,12 @@ async def handle_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
                              group_id,
                              text,
                              file=tmp_file,
-                             ftype=ftype)
+                             ftype=ftype,
+                             user_id=msg.from_user.id)
         await update.message.reply_text("پیامت ناشناس به گروه فرستاده شد ✅")
     except Exception as e:
         logger.exception("خطا در ارسال: %s", e)
         await update.message.reply_text("خطا در ارسال پیام به گروه.")
-
 
 async def vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -163,6 +174,32 @@ async def vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.exception("خطا در رأی‌گیری: %s", e)
 
+# ---------- Edit Last Message ----------
+async def edit_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if user_id not in last_messages:
+        await update.message.reply_text("پیام قبلی پیدا نشد.")
+        return
+
+    msg_id = last_messages[user_id]
+    new_text = " ".join(context.args)
+    if not new_text:
+        await update.message.reply_text("لطفاً متن جدید را بعد از /edit بنویسید.")
+        return
+
+    group_id = cfg.get("group_id")
+    try:
+        # ویرایش متن پیام بدون پاک شدن دکمه‌ها و آرا
+        await context.bot.edit_message_text(
+            chat_id=group_id,
+            message_id=msg_id,
+            text=new_text,
+            reply_markup=build_vote_keyboard(msg_id)
+        )
+        await update.message.reply_text("پیام آخر شما ویرایش شد ✅")
+    except Exception as e:
+        logger.exception("خطا در ویرایش پیام: %s", e)
+        await update.message.reply_text("خطا در ویرایش پیام.")
 
 # ---------- Main ----------
 def main():
@@ -170,16 +207,18 @@ def main():
     keep_alive()
     app = ApplicationBuilder().token(TOKEN).build()
 
+    # Command handlers
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("setgroup", setgroup))
-    app.add_handler(
-        MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND,
-                       handle_private))
+    app.add_handler(CommandHandler("edit", edit_last))
+
+    # Message and callback handlers
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, handle_private))
     app.add_handler(CallbackQueryHandler(vote_callback))
 
     print("Bot started ✅")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
