@@ -10,18 +10,22 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     filters,
+    ConversationHandler,
 )
+
 from keep_alive import keep_alive  # وب‌سرور برای آنلاین ماندن
 
 CONFIG_FILE = 'config.json'
 BAD_WORDS = ["کص", "کون", "کیر"]
-votes = {}          # ذخیره رأی‌ها
-last_messages = {}  # ذخیره آخرین پیام کاربران برای ویرایش
+votes = {}  # ذخیره رأی‌ها
+last_messages = {}  # ذخیره آخرین پیام هر کاربر برای ویرایش
+
+EDIT_WAITING = 1  # مرحله انتظار برای متن جدید ویرایش
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------------- Config ----------------
+# ---------- Config ----------
 def load_config():
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
@@ -39,13 +43,15 @@ def save_config(cfg):
 
 cfg = load_config()
 
-# ---------------- Helpers ----------------
+# ---------- Helpers ----------
 def censor_text(text):
     for word in BAD_WORDS:
         text = text.replace(word, "***")
     return text
 
 def build_vote_keyboard(message_id):
+    if not cfg.get("voting_enabled", False):
+        return None
     like = votes.get(message_id, {}).get("like", 0)
     dislike = votes.get(message_id, {}).get("dislike", 0)
     return InlineKeyboardMarkup([[
@@ -53,11 +59,7 @@ def build_vote_keyboard(message_id):
         InlineKeyboardButton(f"👎 {dislike}", callback_data=f"{message_id}:dislike")
     ]])
 
-async def send_anonymous(context: ContextTypes.DEFAULT_TYPE,
-                         chat_id,
-                         text,
-                         file=None,
-                         ftype=None):
+async def send_anonymous(context: ContextTypes.DEFAULT_TYPE, chat_id, text, file=None, ftype=None):
     msg_kwargs = {"chat_id": chat_id, "caption": text} if ftype else {"chat_id": chat_id, "text": text}
     if ftype == "photo":
         msg = await context.bot.send_photo(photo=file, **msg_kwargs)
@@ -68,19 +70,34 @@ async def send_anonymous(context: ContextTypes.DEFAULT_TYPE,
     else:
         msg = await context.bot.send_message(**msg_kwargs)
 
-    votes[msg.message_id] = {"like": 0, "dislike": 0, "voters": set()}
-
-    if cfg.get("voting_enabled"):
+    # ذخیره رأی‌ها و دکمه رأی‌گیری
+    if cfg.get("voting_enabled", False):
+        votes[msg.message_id] = {"like": 0, "dislike": 0, "voters": set()}
         await msg.edit_reply_markup(reply_markup=build_vote_keyboard(msg.message_id))
 
-    return msg.message_id  # بازگرداندن id پیام برای ویرایش
+    return msg
 
-# ---------------- Handlers ----------------
+# ---------- Handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == 'private':
-        await update.message.reply_text("پیام خودت را اینجا بفرست تا ناشناس در گروه ارسال شود.")
+        await update.message.reply_text(
+            "سلام 👋\nپیام خودت را اینجا بفرست تا ناشناس در گروه ارسال شود.\nبرای مشاهده دستورها /help را بزنید."
+        )
     else:
-        await update.message.reply_text("ادمین باید /setgroup را داخل گروه بزند.")
+        await update.message.reply_text(
+            "ادمین باید /setgroup را داخل گروه بزند."
+        )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = (
+        "دستورهای ربات:\n"
+        "/start - شروع کار با ربات\n"
+        "/setgroup - تعیین گروه برای پیام‌های ناشناس\n"
+        "/edit - ویرایش آخرین پیام ارسال شده\n"
+        "/settings - تنظیمات ربات (فعال/غیرفعال کردن رأی‌گیری)\n"
+        "/help - نمایش این راهنما"
+    )
+    await update.message.reply_text(help_text)
 
 async def setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -91,7 +108,80 @@ async def setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_config(cfg)
     await update.message.reply_text("این گروه به‌عنوان مقصد پیام‌های ناشناس تنظیم شد ✅")
 
-# ---------------- Voting ----------------
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != 'private':
+        await update.message.reply_text("تنظیمات فقط در چت خصوصی قابل تغییر است.")
+        return
+    current = cfg.get("voting_enabled", False)
+    cfg["voting_enabled"] = not current
+    save_config(cfg)
+    status = "فعال" if cfg["voting_enabled"] else "غیرفعال"
+    await update.message.reply_text(f"قابلیت رأی‌گیری اکنون {status} شد.")
+
+async def handle_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        return
+    group_id = cfg.get("group_id")
+    if not group_id:
+        await update.message.reply_text("گروه هنوز تنظیم نشده. ادمین ابتدا /setgroup را اجرا کند.")
+        return
+
+    msg = update.message
+    text = censor_text(msg.caption or msg.text or "")
+
+    tmp_file = None
+    ftype = None
+    try:
+        if msg.photo:
+            file_obj = await msg.photo[-1].get_file()
+            tmp_file = file_obj.file_id
+            ftype = "photo"
+        elif msg.video:
+            file_obj = await msg.video.get_file()
+            tmp_file = file_obj.file_id
+            ftype = "video"
+        elif msg.document:
+            file_obj = await msg.document.get_file()
+            tmp_file = file_obj.file_id
+            ftype = "document"
+
+        sent_msg = await send_anonymous(context, group_id, text, file=tmp_file, ftype=ftype)
+        last_messages[msg.from_user.id] = sent_msg.message_id  # ذخیره آخرین پیام کاربر
+        await update.message.reply_text("پیامت ناشناس به گروه فرستاده شد ✅")
+    except Exception as e:
+        logger.exception("خطا در ارسال: %s", e)
+        await update.message.reply_text("خطا در ارسال پیام به گروه.")
+
+# ---------- ویرایش پیام ----------
+async def edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if user_id not in last_messages:
+        await update.message.reply_text("شما هنوز هیچ پیامی ارسال نکرده‌اید.")
+        return ConversationHandler.END
+    await update.message.reply_text("لطفاً متن جدیدی که می‌خواهید جایگزین کنید را ارسال کنید:")
+    return EDIT_WAITING
+
+async def receive_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if user_id not in last_messages:
+        await update.message.reply_text("هیچ پیام قابل ویرایشی پیدا نشد.")
+        return ConversationHandler.END
+
+    new_text = censor_text(update.message.text)
+    group_id = cfg.get("group_id")
+    message_id = last_messages[user_id]
+
+    try:
+        # ویرایش پیام در گروه
+        await context.bot.edit_message_text(chat_id=group_id, message_id=message_id, text=new_text)
+        await update.message.reply_text("پیام شما با موفقیت ویرایش شد ✅")
+    except Exception as e:
+        logger.exception("خطا در ویرایش پیام: %s", e)
+        await update.message.reply_text("خطا در ویرایش پیام.")
+
+    return ConversationHandler.END
+
+# ---------- رأی‌گیری ----------
 async def vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -110,87 +200,7 @@ async def vote_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.exception("خطا در رأی‌گیری: %s", e)
 
-# ---------------- Settings ----------------
-async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    if chat.type not in ("group", "supergroup"):
-        await update.message.reply_text("این دستور فقط در گروه قابل استفاده است.")
-        return
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ فعال کردن رأی‌گیری", callback_data="voting_on")],
-        [InlineKeyboardButton("❌ غیرفعال کردن رأی‌گیری", callback_data="voting_off")]
-    ])
-    await update.message.reply_text("تنظیمات ربات:", reply_markup=keyboard)
-
-async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == "voting_on":
-        cfg["voting_enabled"] = True
-        save_config(cfg)
-        await query.edit_message_text("رأی‌گیری فعال شد ✅")
-    elif query.data == "voting_off":
-        cfg["voting_enabled"] = False
-        save_config(cfg)
-        await query.edit_message_text("رأی‌گیری غیرفعال شد ❌")
-
-# ---------------- Edit Last Message ----------------
-async def edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    if user_id not in last_messages:
-        await update.message.reply_text("پیام قبلی برای ویرایش پیدا نشد.")
-        return
-    await update.message.reply_text("لطفاً متن جدید پیام خود را در پیام بعدی وارد کنید.")
-    context.user_data["editing"] = True
-
-async def handle_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private":
-        return
-    group_id = cfg.get("group_id")
-    if not group_id:
-        await update.message.reply_text("گروه هنوز تنظیم نشده. ادمین ابتدا /setgroup را اجرا کند.")
-        return
-
-    msg = update.message
-    text = censor_text(msg.caption or msg.text or "")
-
-    if context.user_data.get("editing"):
-        # ویرایش پیام قبلی
-        old_msg_id = last_messages.get(msg.from_user.id)
-        if old_msg_id:
-            try:
-                await context.bot.edit_message_text(chat_id=group_id, message_id=old_msg_id, text=text)
-                await msg.reply_text("پیام شما ویرایش شد ✅")
-            except Exception as e:
-                logger.exception("خطا در ویرایش پیام: %s", e)
-                await msg.reply_text("خطا در ویرایش پیام.")
-        context.user_data["editing"] = False
-        return
-
-    tmp_file = None
-    ftype = None
-    try:
-        if msg.photo:
-            file_obj = await msg.photo[-1].get_file()
-            tmp_file = file_obj.file_id
-            ftype = "photo"
-        elif msg.video:
-            file_obj = await msg.video.get_file()
-            tmp_file = file_obj.file_id
-            ftype = "video"
-        elif msg.document:
-            file_obj = await msg.document.get_file()
-            tmp_file = file_obj.file_id
-            ftype = "document"
-
-        sent_msg_id = await send_anonymous(context, group_id, text, file=tmp_file, ftype=ftype)
-        last_messages[msg.from_user.id] = sent_msg_id
-        await msg.reply_text("پیامت ناشناس به گروه فرستاده شد ✅")
-    except Exception as e:
-        logger.exception("خطا در ارسال: %s", e)
-        await msg.reply_text("خطا در ارسال پیام به گروه.")
-
-# ---------------- Main ----------------
+# ---------- Main ----------
 def main():
     TOKEN = os.environ["BOT_TOKEN"]
     keep_alive()
@@ -198,11 +208,19 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("setgroup", setgroup))
-    app.add_handler(CommandHandler("settings", settings))
-    app.add_handler(CallbackQueryHandler(settings_callback, pattern="voting_"))
-    app.add_handler(CommandHandler("edit", edit))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("settings", settings_command))
+
+    # هندلر ویرایش با ConversationHandler
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("edit", edit_command)],
+        states={EDIT_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_edit)]},
+        fallbacks=[],
+    )
+    app.add_handler(conv_handler)
+
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, handle_private))
-    app.add_handler(CallbackQueryHandler(vote_callback, pattern="\\d+:"))
+    app.add_handler(CallbackQueryHandler(vote_callback))
 
     print("Bot started ✅")
     app.run_polling()
